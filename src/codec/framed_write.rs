@@ -62,19 +62,21 @@ enum Next<B> {
 
 /// Initialize the connection with this amount of write buffer.
 ///
-/// The minimum MAX_FRAME_SIZE is 16kb, so always be able to send a HEADERS
-/// frame that big.
-const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
+/// Leave room for several default-size DATA frames before flushing to the
+/// transport. This allocates 256 KiB per connection; explicit flush and shutdown
+/// still drain short responses without waiting for the buffer to fill.
+const DEFAULT_BUFFER_CAPACITY: usize = 256 * 1_024;
 
-/// Chain payloads bigger than this when vectored I/O is enabled. The remote
-/// will never advertise a max frame size less than this (well, the spec says
-/// the max frame size can't be less than 16kb, so not even close).
-const CHAIN_THRESHOLD: usize = 256;
+/// Copy smaller payloads into the buffer so default-size DATA frames can share
+/// a transport write, including when vectored I/O is enabled. Chaining a payload
+/// forces it to drain before another frame can be buffered. Larger frames still
+/// use chaining when permitted by the peer's maximum frame size.
+const CHAIN_THRESHOLD: usize = 64 * 1_024;
 
 /// Chain payloads bigger than this when vectored I/O is **not** enabled.
-/// A larger value in this scenario will reduce the number of small and
-/// fragmented data being sent, and hereby improve the throughput.
-const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+/// Use the same batching policy for scalar writes. The initial buffer capacity
+/// must exceed this threshold plus the frame header to admit the first frame.
+const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 64 * 1_024;
 
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>

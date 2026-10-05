@@ -1421,8 +1421,30 @@ async fn send_err_with_buffered_data() {
         srv.send_frame(frames::headers(1).response(204).eos()).await;
         rx.await.unwrap();
         srv.unbounded_bytes().await;
-        srv.recv_frame(frames::data(1, vec![0; 16_384])).await;
-        srv.recv_frame(frames::reset(1).cancel()).await;
+        // DATA already encoded before the reset must finish before RST_STREAM.
+        // How many frames fit depends on the codec's write buffer, but it must
+        // never exceed the original flow-control window. The unsent remainder
+        // of the two-window body must be discarded, without END_STREAM.
+        let mut received = 0;
+        loop {
+            let frame = srv.next().await.unwrap().unwrap();
+            if let frame::Frame::Data(data) = frame {
+                assert_eq!(data.stream_id(), 1);
+                assert!(!data.is_end_stream());
+                assert!(!data.payload().is_empty());
+                assert!(data.payload().iter().all(|byte| *byte == 0));
+                received += data.payload().len();
+                assert!(received <= frame::DEFAULT_INITIAL_WINDOW_SIZE as usize);
+            } else {
+                assert_frame_eq(frame, frames::reset(1).cancel());
+                break;
+            }
+        }
+        assert!(
+            received > 0,
+            "test must reset a partially written DATA frame"
+        );
+        // No DATA may follow RST_STREAM; connection cleanup must still finish.
         srv.recv_frame(frames::go_away(0).no_error()).await;
     };
 

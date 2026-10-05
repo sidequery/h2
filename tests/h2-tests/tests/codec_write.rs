@@ -6,6 +6,169 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 
+/// Capture short writes, yielding once before each write, flush, and shutdown.
+/// Unlike a timer-based mock, every Pending result explicitly schedules a retry.
+struct PartialWriteIo {
+    bytes: Vec<u8>,
+    vectored: bool,
+    pending: bool,
+    saw_vectored: bool,
+    flushed: usize,
+    shutdown: bool,
+}
+
+impl PartialWriteIo {
+    fn new(vectored: bool) -> Self {
+        Self {
+            bytes: Vec::new(),
+            vectored,
+            pending: true,
+            saw_vectored: false,
+            flushed: 0,
+            shutdown: false,
+        }
+    }
+
+    fn ready(&mut self, cx: &mut Context<'_>) -> bool {
+        let pending = self.pending;
+        self.pending = !pending;
+        if pending {
+            cx.waker().wake_by_ref();
+        }
+        !pending
+    }
+}
+
+impl AsyncRead for PartialWriteIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        panic!("write-only codec test must not read")
+    }
+}
+
+impl AsyncWrite for PartialWriteIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !self.ready(cx) {
+            return Poll::Pending;
+        }
+        let written = buf.len().min(4093);
+        self.bytes.extend_from_slice(&buf[..written]);
+        Poll::Ready(Ok(written))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.vectored
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        assert!(self.vectored);
+        if !self.ready(cx) {
+            return Poll::Pending;
+        }
+        self.saw_vectored |= bufs.iter().filter(|buf| !buf.is_empty()).count() > 1;
+        let mut written = 0;
+        for buf in bufs {
+            let count = buf.len().min(4093 - written);
+            self.bytes.extend_from_slice(&buf[..count]);
+            written += count;
+            if written == 4093 {
+                break;
+            }
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.ready(cx) {
+            return Poll::Pending;
+        }
+        self.flushed = self.bytes.len();
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.ready(cx) {
+            return Poll::Pending;
+        }
+        assert_eq!(self.flushed, self.bytes.len(), "shutdown before flush");
+        self.shutdown = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn buffer_data(codec: &mut Codec<PartialWriteIo>, expected: &mut Vec<u8>, len: usize) {
+    // Encode the expected wire header independently of the codec under test.
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    expected.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
+    expected.extend_from_slice(&[0, 0, 0, 0, 0, 1]); // DATA, flags, stream 1
+    expected.extend_from_slice(&payload);
+    poll_fn(|cx| codec.poll_ready(cx)).await.unwrap();
+    codec.buffer(frames::data(1, payload).into()).unwrap();
+}
+
+async fn check_batched_data_writes(vectored: bool) {
+    let mut codec = Codec::new(PartialWriteIo::new(vectored));
+    let mut expected = Vec::new();
+
+    // Two default-size frames fit together. Explicit flush must deliver them
+    // even though the buffer is far from full.
+    for _ in 0..2 {
+        buffer_data(&mut codec, &mut expected, 16 * 1024).await;
+    }
+    assert!(codec.get_ref().bytes.is_empty());
+    poll_fn(|cx| codec.flush(cx)).await.unwrap();
+    assert_eq!(codec.get_ref().bytes, expected);
+    assert_eq!(codec.get_ref().flushed, expected.len());
+
+    // Exceed the write buffer to exercise capacity-driven drains as well.
+    let initially_flushed = expected.len();
+    for _ in 0..32 {
+        buffer_data(&mut codec, &mut expected, 16 * 1024).await;
+    }
+    assert!(codec.get_ref().bytes.len() > initially_flushed);
+
+    // A peer may negotiate larger frames. Exercise both sides of the copy /
+    // chain boundary, including the exact threshold and a larger payload.
+    codec.set_max_send_frame_size(128 * 1024);
+    for len in [64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1, 128 * 1024] {
+        buffer_data(&mut codec, &mut expected, len).await;
+    }
+    poll_fn(|cx| codec.flush(cx)).await.unwrap();
+    assert_eq!(codec.get_ref().bytes, expected);
+    assert_eq!(codec.get_ref().flushed, expected.len());
+    assert_eq!(codec.get_ref().saw_vectored, vectored);
+
+    // Shutdown must deliver a final short frame and END_STREAM before closing.
+    poll_fn(|cx| codec.poll_ready(cx)).await.unwrap();
+    codec.buffer(frames::data(1, b"done").eos().into()).unwrap();
+    expected.extend_from_slice(&[0, 0, 4, 0, 1, 0, 0, 0, 1]);
+    expected.extend_from_slice(b"done");
+    poll_fn(|cx| codec.shutdown(cx)).await.unwrap();
+    assert_eq!(codec.get_ref().bytes, expected);
+    assert!(codec.get_ref().shutdown);
+}
+
+#[tokio::test]
+async fn batched_data_partial_scalar_writes() {
+    check_batched_data_writes(false).await;
+}
+
+#[tokio::test]
+async fn batched_data_partial_vectored_writes() {
+    check_batched_data_writes(true).await;
+}
+
 #[tokio::test]
 async fn write_continuation_frames() {
     // An invalid dependency ID results in a stream level error. The hpack
